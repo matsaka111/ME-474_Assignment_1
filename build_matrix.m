@@ -30,6 +30,7 @@ function [A, b, x, y, ux] = build_matrix(nx, ny, L, H, rho, Gamma, Tin, Twall, P
                 % Walls: Dirichlet
                 A(n,n) = 1; b(n) = Twall;
             else
+                % Diffusion term
                 u = ux(j);
                 aE = Gamma/dx^2;
                 aN = Gamma/dy^2;

@@ -69,6 +69,7 @@ title('Lower wall (y=0)');
 grid on;
 
 subplot(2,2,4);
+disp(Tfield)
 plot(x, Tfield(end,:),'LineWidth',1.5);
 xlabel('x [m]'); ylabel('T [°C]');
 title('Upper wall (y=H)');
@@ -110,7 +111,9 @@ maxIter = 5000;
 
 N = nx * ny;
 
-for w = 1:length(omega_vals)
+T = ones(N,1) * Tin;
+
+for w = 1:length(omega_vals)x
     omega = omega_vals(w);
 
     [T_sor, resHist, errHist, iter] = sor_solver(A, b, T, omega, tol, maxIter);
@@ -377,6 +380,7 @@ scheme = 'UD';
 
 Pe_list = [50, 100];
 
+
 figure('Units','normalized','Position',[0.05 0.05 0.9 0.7]);
 
 for p = 1:length(Pe_list)
@@ -427,69 +431,104 @@ fprintf(['As Pe increases, convection dominates diffusion, causing thinner therm
          'requires either higher-order stabilized schemes (e.g., QUICK, TVD) or grid refinement near the walls.\n']);
 
 %% Problem 20: Neumann boundary condition
-
-qwall = 10; % W/m^2
-
+% Parameters
+rho = 1; cp = 10; k = 0.12; nu = 1e-2; Gamma = k/cp;
+H = 1; L = 10;
 nx = 100; ny = 11;
-scheme = "UD";
+Pe = 16.5; Tin = 300; qwall = 10;   % inlet temp + wall flux
+scheme = 'UD';
 
-[A, b, x, y, ux] = build_matrix(nx, ny, L, H, rho, Gamma, Tin, NaN, Pe, scheme);
+dx = L/(nx-1); dy = H/(ny-1);
+umean = Pe*Gamma/(2*H*rho); 
+umax = 3/2*umean;
+x = linspace(0,L,nx); y = linspace(0,H,ny);
+ux = umax*(1-(2*y/H - 1).^2);
 
-% Apply Neumann BC
-dy = H / (ny - 1);
-N = nx * ny;
+N = nx*ny;
+A = sparse(N,N);
+b = zeros(N,1);
 
-for i = 1:nx
-    % Bottom wall node (j=1)
-    n_bot = (i-1)*ny + 1;
-    n_nb  = n_bot + 1; 
-    A(n_bot,:) = 0; 
-    A(n_bot, n_bot) = 1;
-    A(n_bot, n_nb) = -1;
-    b(n_bot) = qwall * dy / k; % T1 - T2 = qwall*dy/k
+idx = @(i,j) (j-1)*nx + i;
 
-    % Top wall node (j=ny)
-    n_top = (i-1)*ny + ny;
-    n_nb  = n_top - 1;
-    A(n_top,:) = 0;
-    A(n_top, n_top) = 1;
-    A(n_top, n_nb) = -1;
-    b(n_top) = -qwall * dy / k; % Tny - Tny-1 = -qwall*dy/k
-end
-
-% Dirichlet at inlet x = 0
+% Build matrix
 for j = 1:ny
-    n = j;
-    A(n,:) = 0;
-    A(n,n) = 1;
-    b(n) = Tin;
+    for i = 1:nx
+        n = idx(i,j);
+        u = ux(j);  % local velocity
+
+        % Inlet (Dirichlet)
+        if i == 1
+            A(n,n) = 1;
+            b(n) = Tin;
+
+        % Outlet (Neumann, zero-gradient)
+        elseif i == nx
+            nW = idx(i-1,j);
+            A(n,:) = 0;
+            A(n,n) = 1;
+            A(n,nW) = -1;
+            b(n) = 0;
+
+        % Bottom wall (Neumann)
+        elseif j == 1
+            nN = idx(i,j+1);
+            A(n,:) = 0;
+            A(n,n) = 1;
+            A(n,nN) = -1;
+            b(n) = qwall*dy/k;
+
+        % Top wall (Neumann)
+        elseif j == ny
+            nS = idx(i,j-1);
+            A(n,:) = 0;
+            A(n,n) = 1;
+            A(n,nS) = -1;
+            b(n) = -qwall*dy/k;
+
+        % Interior nodes (diffusion + convection)
+        else
+            aE = Gamma/dx^2;
+            aN = Gamma/dy^2;
+            aS = Gamma/dy^2;
+
+            if i == 2
+                aW = Gamma/dx^2 + rho*u/dx;  % first interior column: UD
+            else
+                if strcmp(scheme,'UD')
+                    aW = Gamma/dx^2 + rho*u/dx;
+                elseif strcmp(scheme,'QUICK')
+                    aW = Gamma/dx^2 + (6/8*rho*u/dx - 1/8*rho*u/dx);
+                end
+            end
+
+            A(n,n) = aE + aW + aN + aS;
+            A(n,idx(i+1,j)) = -aE;
+            A(n,idx(i-1,j)) = -aW;
+            A(n,idx(i,j+1)) = -aN;
+            A(n,idx(i,j-1)) = -aS;
+        end
+    end
 end
 
-% Solve
-T = A \ b;
-Tfield = reshape(T, [nx, ny])';
+% Solve system
+T = A\b;
+Tfield = reshape(T,[nx,ny])';
 
+% Plot temperature
 figure;
-contourf(x, y, Tfield, 30, 'LineColor','none');
-colorbar;
-xlabel('x [m]'); ylabel('y [m]');
-title('Temperature Field T(x,y) with Neumann Wall BC (q_{wall}=10 W/m^2)');
+contourf(x,y,Tfield,30,'LineColor','none');
+colorbar; xlabel('x'); ylabel('y');
+title('T(x,y) with Neumann wall BC');
 
-% Check flux consistency
-dy = H / (ny - 1);
-q_bottom_num = -k * (Tfield(2,:) - Tfield(1,:)) / dy;
-fprintf('Average numerical bottom wall flux = %.3f W/m² (target = %.2f)\n', ...
-        mean(q_bottom_num), qwall);
+% Check wall flux
+q_bottom_num = -k*(Tfield(2,:) - Tfield(1,:))/dy;
+fprintf('Average bottom wall flux = %.3f W/m² (target = %.2f)\n', mean(q_bottom_num), qwall);
 
-% Plot Nu_q(x)
-Nuq = (2*H/k) .* q_bottom_num ./ (mean(Tfield) - Tin);
-
-figure;
-plot(x, Nuq, 'LineWidth', 1.5);
-xlabel('x [m]');
-ylabel('Nu_q(x)');
-title('Local Nusselt number Nu_q(x) with Neumann wall condition');
-grid on;
+% Compute Nu_q along bottom wall
+Nuq = (2*H/k) .* q_bottom_num ./ (mean(Tfield(:)) - Tin);
+figure; plot(x,Nuq,'LineWidth',1.5);
+xlabel('x [m]'); ylabel('Nu_q(x)'); grid on;
+title('Local Nusselt number along bottom wall');
 
 fprintf(['\n--- Problem 20 Summary ---\n' ...
          'The Neumann BCs replace fixed wall temperatures by fixed heat flux q_wall.\n' ...
@@ -596,3 +635,168 @@ yline(qwall_uniform,'r--','Target q_{wall}');
 xlabel('x'); ylabel('q_{bottom}(x) [W/m^2]');
 title('Numerical bottom wall flux vs target'); grid on;
 
+%% Problem 22: Local heating 2 <= x <= 5 on lower wall
+% Task: find qwall values (uniform over 2<=x<=5 region) that produce outlet
+% velocity-weighted mean temperatures approx 60, 70, 80 degC.
+% Approach: bisection on q_mag for each target. Walls are adiabatic elsewhere.
+
+nx = 400; ny = 41;
+Pe = 16.5;
+Tin = 50;
+scheme = "UD";
+x_region = [2, 5];   % m, heating region on lower wall
+targets = [60, 70, 80];   % desired outlet velocity-weighted mean temperatures (degC)
+tolerance_T = 0.05;       % acceptable temperature tolerance [degC]
+max_bisect_iter = 30;
+
+% Precompute grid and template matrix
+[A0, b0, xg, yg, uxg] = build_matrix(nx, ny, L, H, rho, Gamma, Tin, Twall, Pe, scheme);
+
+% If build_matrix doesn't output b0 (some versions don’t), ensure it's initialized
+if isempty(b0)
+    b0 = zeros(size(A0,1),1);
+end
+
+dx = L/(nx-1); 
+dy = H/(ny-1);
+idx = @(i,j) (j-1)*nx + i;
+
+% Determine indices of bottom nodes that fall into [2,5]
+ix_start = find(xg >= x_region(1), 1, 'first');
+ix_end   = find(xg <= x_region(2), 1, 'last');
+if isempty(ix_start) || isempty(ix_end)
+    error('Heating region indices not found (check grid and region bounds).');
+end
+heating_indices = ix_start:ix_end;
+
+% Perform bisection for each target
+q_required = zeros(size(targets));
+for tt = 1:length(targets)
+    Ttarget = targets(tt);
+
+    % Initial bracket
+    q_low = 0;
+    q_high = 1e4;
+
+    T_low = outlet_mean_for_q(q_low, A0, b0, nx, ny, idx, heating_indices, ...
+        xg, yg, uxg, Tin, k, dy);
+    T_high = outlet_mean_for_q(q_high, A0, b0, nx, ny, idx, heating_indices, ...
+        xg, yg, uxg, Tin, k, dy);
+
+    if T_high < Ttarget
+        error('q_high too small, increase q_high.');
+    end
+
+    % Bisection loop
+    for iter = 1:max_bisect_iter
+        q_mid = 0.5 * (q_low + q_high);
+        T_mid = outlet_mean_for_q(q_mid, A0, b0, nx, ny, idx, heating_indices, ...
+            xg, yg, uxg, Tin, k, dy);
+
+        if abs(T_mid - Ttarget) < tolerance_T
+            break;
+        end
+        if T_mid < Ttarget
+            q_low = q_mid;
+        else
+            q_high = q_mid;
+        end
+    end
+
+    q_required(tt) = q_mid;
+    fprintf('Target T_out = %d °C -> q_required = %.3f W/m^2 (iter=%d), achieved T_out = %.3f\n', ...
+        Ttarget, q_mid, iter, T_mid);
+end
+
+%% Display results
+fprintf('\n--- Problem 22 Results ---\n');
+for tt = 1:length(targets)
+    fprintf('Target %d°C -> q_required = %.3f W/m^2\n', targets(tt), q_required(tt));
+end
+
+%% Plot one example solution
+q_plot = q_required(2);
+Tmean_out_plot = outlet_mean_for_q(q_plot, A0, b0, nx, ny, idx, heating_indices, ...
+    xg, yg, uxg, Tin, k, dy);
+
+% Rebuild matrix for visualization
+A = A0; b = b0;
+for i = 1:nx
+    % Bottom wall
+    n_bot = idx(i,1); n_bot_nb = idx(i,2);
+    q_here = 0; if ismember(i, heating_indices), q_here = q_plot; end
+    A(n_bot,:) = 0; A(n_bot,n_bot) = 1; A(n_bot,n_bot_nb) = -1; b(n_bot) = q_here*dy/k;
+    % Top wall (adiabatic)
+    n_top = idx(i,ny); n_top_nb = idx(i,ny-1);
+    A(n_top,:) = 0; A(n_top,n_top) = 1; A(n_top,n_top_nb) = -1; b(n_top) = 0;
+end
+for j = 1:ny
+    n_in = idx(1,j); A(n_in,:) = 0; A(n_in,n_in) = 1; b(n_in) = Tin;
+end
+
+Tfinal = A\b;
+Tfield_final = reshape(Tfinal, [nx, ny])';
+
+% Temperature field plot
+figure;
+contourf(xg, yg, Tfield_final, 30, 'LineColor', 'none'); colorbar;
+xlabel('x [m]'); ylabel('y [m]');
+title(sprintf('Temperature field, q=%.2f W/m^2 in x∈[%.1f,%.1f], outlet mean = %.2f°C', ...
+    q_plot, x_region(1), x_region(2), Tmean_out_plot));
+
+% Bottom wall flux profile
+q_bottom_final = -k * (Tfield_final(2,:) - Tfield_final(1,:)) / dy;
+figure;
+plot(xg, q_bottom_final, '-o'); hold on;
+plot(xg(heating_indices), q_bottom_final(heating_indices), 'r.', 'MarkerSize', 12);
+xlabel('x [m]'); ylabel('q_{bottom}(x) [W/m^2]'); grid on;
+title('Numerical bottom wall flux (red markers indicate heating region)');
+
+fprintf(['\nProblem 22 comment:\n' ...
+    '- The required heating flux q (W/m^2) found by bisection is printed above\n' ...
+    '- The resulting outlet velocity-weighted mean temperature matches the target within tolerance.\n' ...
+    '- Note required q values depend on mesh resolution and on neglecting axial conduction in inlet/outlet discretization.\n']);
+
+
+function Tmean_out = outlet_mean_for_q(q_mag, A0, b0, nx, ny, idx, heating_indices, xg, yg, uxg, Tin, k, dy)
+    A = A0; b = b0;
+
+    % Apply boundary conditions
+    for i = 1:nx
+        % Bottom wall
+        n_bot = idx(i,1); n_bot_nb = idx(i,2);
+        q_here = 0;
+        if ismember(i, heating_indices)
+            q_here = q_mag;
+        end
+        A(n_bot,:) = 0;
+        A(n_bot,n_bot) = 1;
+        A(n_bot,n_bot_nb) = -1;
+        b(n_bot) = q_here * dy / k;
+
+        % Top wall: adiabatic
+        n_top = idx(i,ny); n_top_nb = idx(i,ny-1);
+        A(n_top,:) = 0;
+        A(n_top,n_top) = 1;
+        A(n_top,n_top_nb) = -1;
+        b(n_top) = 0;
+    end
+
+    % Re-impose inlet Dirichlet
+    for j = 1:ny
+        n_in = idx(1,j);
+        A(n_in,:) = 0;
+        A(n_in,n_in) = 1;
+        b(n_in) = Tin;
+    end
+
+    % Solve
+    Tloc = A\b;
+    Tfield_loc = reshape(Tloc, [nx, ny])';
+
+    % Outlet temperature profile
+    To_loc = Tfield_loc(:,end)'; 
+
+    % Velocity-weighted mean temperature at outlet
+    Tmean_out = trapz(yg, uxg .* To_loc) / trapz(yg, uxg);
+end
