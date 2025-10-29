@@ -430,12 +430,13 @@ fprintf(['As Pe increases, convection dominates diffusion, causing thinner therm
          'or finer meshes are used. The problem becomes convection-dominated, and resolving boundary layers\n' ...
          'requires either higher-order stabilized schemes (e.g., QUICK, TVD) or grid refinement near the walls.\n']);
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Problem 20: Neumann boundary condition
 % Parameters
 rho = 1; cp = 10; k = 0.12; nu = 1e-2; Gamma = k/cp;
 H = 1; L = 10;
 nx = 100; ny = 11;
-Pe = 16.5; Tin = 300; qwall = 10;   % inlet temp + wall flux
+Pe = 16.5; Tin = 50; qwall = 10;   % inlet temp + wall flux
 scheme = 'UD';
 
 dx = L/(nx-1); dy = H/(ny-1);
@@ -519,16 +520,20 @@ figure;
 contourf(x,y,Tfield,30,'LineColor','none');
 colorbar; xlabel('x'); ylabel('y');
 title('T(x,y) with Neumann wall BC');
+Tb_local = mean(Tfield, 1);    % 1 x nx
 
-% Check wall flux
-q_bottom_num = -k*(Tfield(2,:) - Tfield(1,:))/dy;
-fprintf('Average bottom wall flux = %.3f W/m² (target = %.2f)\n', mean(q_bottom_num), qwall);
+% local wall temperature at bottom (y = 0)
+Tw_bottom = Tfield(1, :);      % 1 x nx
 
-% Compute Nu_q along bottom wall
-Nuq = (2*H/k) .* q_bottom_num ./ (mean(Tfield(:)) - Tin);
-figure; plot(x,Nuq,'LineWidth',1.5);
-xlabel('x [m]'); ylabel('Nu_q(x)'); grid on;
-title('Local Nusselt number along bottom wall');
+% local Nusselt number using local Tb and Tw
+Nu_local = (2*H./k) .* q_bottom_num ./ (Tw_bottom - Tb_local);
+
+% plot
+figure;
+plot(x, Nu_local, 'LineWidth', 1.5);
+xlabel('x [m]'); ylabel('Nu(x)');
+grid on;
+title('Local Nusselt number along bottom wall (local Tw and Tb)');
 
 fprintf(['\n--- Problem 20 Summary ---\n' ...
          'The Neumann BCs replace fixed wall temperatures by fixed heat flux q_wall.\n' ...
@@ -536,104 +541,44 @@ fprintf(['\n--- Problem 20 Summary ---\n' ...
          'Numerical wall flux verification confirms correct boundary implementation.\n']);
 
 
-%% Problem 21: Global energy balance for uniform wall flux
-% Uniform wall flux case (reuse Problem 20 style). We compute heat through:
-%  - Inlet (convection): Q_in = int_0^H rho*cp*ux(y)*T_in dy
-%  - Outlet (convection): Q_out = int_0^H rho*cp*ux(y)*T(L,y) dy
-%  - Bottom wall flux: Qb = int_0^L q_bottom(x) dx  (positive into fluid)
-%  - Top wall flux: Qt = int_0^L q_top(x) dx
-% Global balance: Q_in + Qb + Qt - Q_out  ≈ 0
+%% Problem 21: Energy balance
+% ----- compute numeric fluxes for energy balance -----
+% Tfield is ny x nx, rows = y (1 bottom ... end top), cols = x (1 inlet ... nx outlet)
 
-% Parameters for Problem 21
-nx = 100; ny = 21;
-Pe = 16.5;
-Tin = 50;
-qwall_uniform = 10;
-scheme = "UD";
+% 1) local wall fluxes (positive = INTO the domain)
+q_bottom_in = -k * ( Tfield(2,:)   - Tfield(1,:)   ) / dy;    % 1 x nx
+q_top_in    = -k * ( Tfield(end-1,:) - Tfield(end,:) ) / dy; % 1 x nx
+% NOTE: signs chosen so positive means heat entering the fluid domain.
 
-% Build system 
-[A, b, x, y, ux] = build_matrix(nx, ny, L, H, rho, Gamma, Tin, Twall, Pe, scheme);
+% 2) integrate wall fluxes along x (use trapezoidal rule)
+Q_bottom = trapz(x, q_bottom_in);   % [W/m] per unit depth (integral along x)
+Q_top    = trapz(x, q_top_in);      % [W/m]
 
-dx = L / (nx - 1);
-dy = H / (ny - 1);
-idx = @(i,j) (j-1)*nx + i;
+% 3) convective inlet/outlet (integrate rho*cp*u(y)*T(y) along y)
+% u profile stored in ux (1 x ny) as given earlier; ensure orientation
+u_y = ux;                % 1 x ny
+T_inlet  = Tfield(:,1);  % ny x 1
+T_outlet = Tfield(:,end);% ny x 1
 
-% Overwrite bottom & top rows to impose uniform Neumann qwall_uniform
-% Bottom (j=1): T(1) - T(2) = q*dy/k  => A(row, row) = 1; A(row, idx(i,2)) = -1; b = q*dy/k
-% Top (j=ny): T(ny) - T(ny-1) = q*dy/k
-q_bottom_profile = qwall_uniform * ones(1,nx);
-q_top_profile    = qwall_uniform * ones(1,nx);
+% integrate in y with trapz (make sure y matches rows)
+Q_inlet  = trapz(y, rho*cp .* u_y' .* T_inlet);   % scalar [W/m]
+Q_outlet = trapz(y, rho*cp .* u_y' .* T_outlet);  % scalar [W/m]
 
-% Apply Neumann on bottom and top
-for i = 1:nx
-    % bottom
-    n_bot = idx(i,1);
-    n_bot_nb = idx(i,2);
-    A(n_bot,:) = 0;
-    A(n_bot,n_bot) = 1;
-    A(n_bot,n_bot_nb) = -1;
-    b(n_bot) = q_bottom_profile(i)*dy / k;
+% 4) global residual (positive => net heat ENTERING domain)
+Residual = Q_inlet + Q_bottom + Q_top - Q_outlet;
 
-    % top
-    n_top = idx(i,ny);
-    n_top_nb = idx(i,ny-1);
-    A(n_top,:) = 0;
-    A(n_top,n_top) = 1;
-    A(n_top,n_top_nb) = -1;
-    b(n_top) = q_top_profile(i)*dy / k;
-end
+% 5) relative residual (normalize by typical magnitude)
+scale = max([abs(Q_inlet), abs(Q_outlet), abs(Q_bottom)+abs(Q_top), 1e-12]);
+RelRes = Residual / scale;
 
-% Re enforce inlet Dirichlet
-for j = 1:ny
-    n_in = idx(1,j);
-    A(n_in,:) = 0;
-    A(n_in,n_in) = 1;
-    b(n_in) = Tin;
-end
+% Print results
+fprintf('Q_inlet  = %.6g W/m\n', Q_inlet);
+fprintf('Q_outlet = %.6g W/m\n', Q_outlet);
+fprintf('Q_bottom = %.6g W/m\n', Q_bottom);
+fprintf('Q_top    = %.6g W/m\n', Q_top);
+fprintf('Residual = Q_in + Q_bottom + Q_top - Q_out = %.6g W/m\n', Residual);
+fprintf('Relative residual = %.3e (Residual / scale)\n', RelRes);
 
-T = A \ b;
-Tfield = reshape(T, [nx, ny])';  % ny x nx
-
-% Compute fluxes and global balance
-% Inlet convective heat flow (positive into domain)
-Q_in = trapz(y, rho * cp .* ux .* Tin); % Tin constant at inlet
-
-% Outlet convective heat flow
-To_num = Tfield(:,end)'; % 1 x ny
-Q_out = trapz(y, rho * cp .* ux .* To_num);
-
-% Bottom numeric flux (forward difference from wall into fluid)
-q_bottom_num = -k * (Tfield(2,:) - Tfield(1,:)) / dy;  % 1 x nx, positive into fluid
-Qb_total = trapz(x, q_bottom_num);
-
-% Top numeric flux (backward difference)
-q_top_num = k * (Tfield(end,:) - Tfield(end-1,:)) / dy;  % 1 x nx
-Qt_total = trapz(x, q_top_num);
-
-% Global residual (should be ~0)
-global_residual = Q_in + Qb_total + Qt_total - Q_out;
-relative_residual = global_residual / max([abs(Q_in), abs(Q_out), abs(Qb_total)+abs(Qt_total), 1e-12]);
-
-% Print diagnostics
-fprintf('\n--- Problem 21: Global energy balance (uniform qwall = %.2f W/m^2) ---\n', qwall_uniform);
-fprintf('Q_in  (convection at inlet)  = %.6f W per unit depth\n', Q_in);
-fprintf('Q_out (convection at outlet) = %.6f W per unit depth\n', Q_out);
-fprintf('Q_bottom (integrated numerical) = %.6f W per unit depth\n', Qb_total);
-fprintf('Q_top    (integrated numerical) = %.6f W per unit depth\n', Qt_total);
-fprintf('Global residual (Q_in + Qb + Qt - Q_out) = %.6e W per unit depth\n', global_residual);
-fprintf('Relative residual = %.6e\n', relative_residual);
-
-% Plot
-figure;
-subplot(1,2,1);
-contourf(x, y, Tfield, 30, 'LineColor','none'); colorbar;
-xlabel('x'); ylabel('y'); title('T(x,y) with uniform wall flux (Problem 21)');
-
-subplot(1,2,2);
-plot(x, q_bottom_num, '-o'); hold on;
-yline(qwall_uniform,'r--','Target q_{wall}');
-xlabel('x'); ylabel('q_{bottom}(x) [W/m^2]');
-title('Numerical bottom wall flux vs target'); grid on;
 
 %% Problem 22: Local heating 2 <= x <= 5 on lower wall
 % Task: find qwall values (uniform over 2<=x<=5 region) that produce outlet
